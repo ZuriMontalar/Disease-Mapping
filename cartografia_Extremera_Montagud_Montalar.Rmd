@@ -1,0 +1,166 @@
+---
+title: "Cartografía de Enfermedades"
+author:
+  - Irene Extremera
+  - María Montagud
+  - Zuri Montalar
+date: "14/12/2020"
+output:
+  pdf_document: default
+subtitle: Máster en Bioestadística
+editor_options:
+  chunk_output_type: console
+---
+
+<div style="text-align: justify">
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(eval = TRUE, echo = FALSE, warning = FALSE, 
+    error = FALSE, message = FALSE, comment = " ")
+```
+
+
+```{r}
+library(sp)
+library(coda)
+library(boot)
+library(spData)
+library(rgdal)
+library(sf)
+library(raster)
+library(spdep)
+library(R2WinBUGS)
+library(RColorBrewer)
+library(ggplot2)
+library(gridExtra)
+library(grid)
+# library(formatR)  # tidy_source(width.cutoff = 60)
+
+# Cargamos los datos
+cartografia <- readOGR(file.path("datos", "aragon.shp"))
+load(file.path("datos", "aragon.Rdata"))
+
+# Establecemos las relaciones de vecindad
+vecinos <- poly2nb(cartografia)  # Creamos un objeto que es una lista de vecinos
+vecinos_WB <- nb2WB(vecinos)  # Para poder usarlo en WinBUGS
+```
+
+```{r comment = FALSE}
+# Vamos a ver si está ordenado correctamente
+# View(cartografia); head(cartografia)
+aragon <- cbind(distancia, E, O)
+
+# View(aragon)
+# cartografia$CODMUNI
+
+# Organizamos CODMUNI
+cartografia <- cartografia[order(cartografia$CODMUNI), ]
+```
+
+# Introducción
+
+Queremos estudiar la mortalidad por enfermedad isquémica en hombres en Aragón durante el periodo 1991-2000. Modelizaremos entonces la Razón de Mortalidad Estandarizada (RME) de los 729 municipios de esa comunidad autónoma y, para evitar los problemas de estimación en áreas pequeñas, incluiremos en el modelo efectos aleatorios con dependencia espacial y heterogéneo. Más concretamente, implementaremos el modelo de Besag, York y Mollié (BYM), que recurre a los modelos jerárquicos bayesianos.
+
+Aparte, otro de los objetivos de la práctica ha sido hacer posible que este archivo pueda ser compilado por cualquier persona que disponga de él (reproducibilidad).
+Para ello hemos realizado las siguientes acciones: 
+
+- Hemos creado un proyecto y hemos utilizado rutas relativas para acceder a los datos, de modo que las rutinas sean independientes del directorio de trabajo donde estén ubicadas.
+
+- Para darle formato coherente a lo largo de todo el trabajo hemos usado el paquete *formatR* y usado la función `tidy_source()`. 
+
+# Modelo
+
+El modelo que vamos a estimar es el siguiente:
+
+\begin{eqnarray}
+\nonumber
+Obs_i\sim Poisson(\mu_i) \\
+\nonumber
+\log(mu_i)=\log(Esp_i)+m+het_i+sp_i
+\nonumber
+\end{eqnarray}
+
+Al efecto espacial (*sp*) le asignamos una distribución CAR-normal y al efecto heterogéneo una distribución Normal centrada en cero.
+
+El código R utilizado para crear el modelo, así como el resto del código del trabajo se encuentran en el Anexo.
+
+
+```{r}
+set.seed(17)  # Fijamos una semilla
+
+# Modelo Bayesiano
+
+modelo_wb <- function() {
+    
+    # Verosimilitud
+    for (i in 1:n) {
+        Obs[i] ~ dpois(mu[i])
+        log(mu[i]) <- log(Esp[i]) + m + het[i] + sp[i]
+        het[i] ~ dnorm(0, prechet)
+        R[i] <- exp(m + het[i] + sp[i])  # RME 
+    }
+    
+    # Distribuciones a priori
+    sp[1:n] ~ car.normal(adj[], w[], num[], precsp)
+    m ~ dflat()
+    prechet <- pow(sdhet, -2)
+    precsp <- pow(sdsp, -2)
+    sdhet ~ dunif(0, 10)
+    sdsp ~ dunif(0, 10)
+    
+    for (i in 1:n) {
+        prob_r[i] <- step(R[i] - 1)
+    }  # R - 1, porque queremos ver las veces que es mayor que 1 
+}
+
+# Datos
+datos <- list(Obs = O, Esp = E, n = 729, adj = vecinos_WB$adj, 
+    w = vecinos_WB$weights, num = vecinos_WB$num)
+
+# Iniciales
+iniciales <- function() {
+    list(m = rnorm(1, 0, 1), sdhet = runif(1, 0, 1), sdsp = runif(1, 
+        0, 1))
+}
+
+# Parámetros
+parametros <- c("m", "prechet", "precsp", "sdhet", "sdsp", "prob_r", 
+    "R")
+
+# Resultados
+resul <- bugs(data = datos, inits = iniciales, parameters = parametros, 
+    model = modelo_wb, n.iter = 10000, n.burnin = 1000)
+```
+
+
+```{r, fig.width = 10, flg.height = 10}
+R <- resul$sims.array
+
+cartografia$media_RME <- resul$mean$R  # Media a posteriori RME
+cartografia$prob_RME <- resul$mean$prob_r  # Prob. media a posteriori RME
+
+# Media a posteriori RME y de P(RME>1)
+grid.arrange(spplot(cartografia, c("media_RME"), col.regions = colorRampPalette(brewer.pal(9, 
+    "BuPu"))(101), cuts = 100, main = "Media a posteriori RME", 
+    colorkey = list(space = "bottom"), par.settings = list(axis.line = list(col = "transparent"))), 
+    spplot(cartografia, c("prob_RME"), col.regions = colorRampPalette(brewer.pal(9, 
+        "BuPu"))(101), cuts = 100, main = "Media de P(RME>1)", 
+        colorkey = list(space = "bottom"), par.settings = list(axis.line = list(col = "transparent"))), 
+    bottom = textGrob("Figura 1. Cartografía de enfermedad por isquemia en Aragón", 
+        gp = gpar(fontsize = 18, fontfamily = "serif"), just = "center"), 
+    ncol = 2)
+```
+
+Tenemos que la probabilidad de que la razón de mortalidad estandarizada sea mayor que 1 es por lo general más elevada en la parte central de esta comunidad autónoma que en el norte o sur, sobre todo en la parte oeste, en comarcas como por ejemplo Tarazona y el Moncayo, Campo de Borja, Ribera Alta del Ebro y Cinco Villas. Sería por tanto en esta zona oeste de la provincia de Zaragoza donde pensamos que la mortalidad a causa de enfermedad isquémica es más preocupante en Aragón en el periodo de estudio.
+
+# Anexo
+
+## Código de R
+
+
+```{r ref.label = knitr::all_labels(), echo = TRUE, eval = FALSE}
+
+```
+
+
+
